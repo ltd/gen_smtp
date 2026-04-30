@@ -104,7 +104,22 @@ connect(Protocol, Address, Port, Opts) ->
     Time :: non_neg_integer() | 'infinity'
 ) -> {ok, socket()} | {error, any()}.
 connect(tcp, Address, Port, Opts, Time) ->
-    gen_tcp:connect(Address, Port, tcp_connect_options(Opts), Time);
+    error_logger:error_msg("Opts: ~p~n", [Opts]),
+    ProxyOptions = proplists:get_value(proxy,Opts),
+    error_logger:error_msg("CONNECT: ProxyOptions: ~p~n", [ProxyOptions, Address]),
+
+    case ProxyOptions of
+        undefined -> 
+            gen_tcp:connect(Address, Port, tcp_connect_options(Opts), Time);
+        {ProxyHost, ProxyPort} ->
+             case socks5_client:connect(ProxyHost, ProxyPort, Address, Port) of
+                {ok, Socket} -> 
+                    ok = inet:setopts(Socket, [{packet, line}]),
+                    error_logger:error_msg("CONNECT: x: ~p~n", [Socket]),
+                    {ok, Socket};
+                {error, Reason} -> {error, Reason}
+            end
+    end;
 connect(ssl, Address, Port, Opts, Time) ->
     ssl:connect(Address, Port, ssl_connect_options(Opts), Time).
 
