@@ -876,7 +876,15 @@ choose_transformation(Body) ->
 %% * \r and \n are only allowed as `\r\n' pair, but not standalone (bare)
 %% * No lines over 998 chars
 %%
-%% Unfortunately, any string that ends with `\n` matches the regexp, so, we need some pre-checks
+%% The byte and CRLF rules used to be checked with
+%% `re:run(Body, "^([\x01-\x09\x0b-\x0c\x0e-\x7f]|(\r\n))*$", [{capture, none}])'
+%% (plus a pre-check, because `$' also matches before a trailing `\n'). A repeated
+%% capturing group makes the regexp engine keep state per matched byte: several
+%% hundred bytes of memory per byte of body. `only_7bit_and_crlf/1' gives the same
+%% answer in one pass and constant memory.
+%%
+%% The single-byte clauses are kept as they were, so any single byte other than
+%% `\r' and `\n' (including 0 and 128..255) is still reported as valid.
 valid_7bit(<<"\n">>) ->
     false;
 valid_7bit(<<"\r">>) ->
@@ -886,18 +894,20 @@ valid_7bit(<<>>) ->
 valid_7bit(<<_>>) ->
     true;
 valid_7bit(Body) ->
-    Size = byte_size(Body),
-    case binary:at(Body, Size - 1) =:= $\n andalso binary:at(Body, Size - 2) =/= $\r of
-        true ->
-            %% last element is \n, but the one before the last is not \r
-            false;
-        false ->
-            %% So: (all except `\r` and `\n` in 1-127 range) OR (`\r\n`)
-            case re:run(Body, "^([\x01-\x09\x0b-\x0c\x0e-\x7f]|(\r\n))*$", [{capture, none}]) of
-                match -> not has_lines_over_998(Body);
-                nomatch -> false
-            end
-    end.
+    only_7bit_and_crlf(Body) andalso not has_lines_over_998(Body).
+
+%% @doc If every byte of `Body' is in 1..127, every `\r' is immediately followed by
+%% `\n' and every `\n' is immediately preceded by `\r'.
+%% Only ever recurses on the tail of its single binary argument, so the compiler
+%% keeps one match context and no sub-binaries are created.
+only_7bit_and_crlf(<<"\r\n", Rest/binary>>) ->
+    only_7bit_and_crlf(Rest);
+only_7bit_and_crlf(<<C, Rest/binary>>) when C >= 1, C =< 127, C =/= $\r, C =/= $\n ->
+    only_7bit_and_crlf(Rest);
+only_7bit_and_crlf(<<>>) ->
+    true;
+only_7bit_and_crlf(_) ->
+    false.
 
 %% @doc If `Body' has at least one line (ending with `\r\n') that is longer than 998 chars
 has_lines_over_998(Body) ->
@@ -2335,6 +2345,23 @@ valid_smtp_mime_7bit_test() ->
     ?assertNot(valid_7bit(<<128, 200, 255>>)),
     ?assertNot(valid_7bit(<<0, 0, 0>>)),
     ?assertNot(valid_7bit(<<"hello", 128, 0, 200>>)),
+    %% single bytes: anything but a bare `\r' or `\n' (kept as it always was)
+    [?assert(valid_7bit(<<C>>)) || C <- lists:seq(0, 255), C =/= $\r, C =/= $\n],
+    %% trailing `\r\n', bare `\r' and bare `\n'
+    ?assert(valid_7bit(<<"abc\r\n">>)),
+    ?assert(valid_7bit(<<"\r\n">>)),
+    ?assert(valid_7bit(<<"\r\n\r\n">>)),
+    ?assertNot(valid_7bit(<<"abc\n">>)),
+    ?assertNot(valid_7bit(<<"abc\r">>)),
+    ?assertNot(valid_7bit(<<"abc\r\n\n">>)),
+    ?assertNot(valid_7bit(<<"abc\r\r\n">>)),
+    ?assertNot(valid_7bit(<<"\n\r">>)),
+    ?assertNot(valid_7bit(<<"ab", 0>>)),
+    ?assertNot(valid_7bit(<<"ab", 128>>)),
+    %% the line length rule still applies after the byte scan
+    ?assert(valid_7bit(<<(binary:copy(<<$a>>, 997))/binary, "\r\n", (binary:copy(<<$a>>, 997))/binary>>)),
+    ?assertNot(valid_7bit(<<(binary:copy(<<$a>>, 998))/binary, "\r\n">>)),
+    ?assertNot(valid_7bit(binary:copy(<<$a>>, 998))),
     %% Long lines
     Line800 = binary:copy(<<$a>>, 800),
     ?assertNot(has_lines_over_998(Line800)),
@@ -2345,6 +2372,101 @@ valid_smtp_mime_7bit_test() ->
     Many1000Lines = list_to_binary(lists:join("\r\n", lists:duplicate(10, Line1000))),
     ?assert(has_lines_over_998(Many1000Lines)),
     ?assert(has_lines_over_998(<<Line800/binary, "\r\n", Line1000/binary>>)).
+
+%% The regexp based check that `valid_7bit/1' used up to 1.3.0, kept as the
+%% reference for the differential tests below. The two are only required to agree
+%% on small inputs: on a large body `re:run/3' returns `nomatch' when the engine's
+%% match limit is hit (errors are not reported without `report_errors'), so the old
+%% check could answer `false' for a body that is valid 7bit. There the scan is right.
+valid_7bit_re_reference(<<"\n">>) ->
+    false;
+valid_7bit_re_reference(<<"\r">>) ->
+    false;
+valid_7bit_re_reference(<<>>) ->
+    true;
+valid_7bit_re_reference(<<_>>) ->
+    true;
+valid_7bit_re_reference(Body) ->
+    Size = byte_size(Body),
+    case binary:at(Body, Size - 1) =:= $\n andalso binary:at(Body, Size - 2) =/= $\r of
+        true ->
+            false;
+        false ->
+            case re:run(Body, "^([\x01-\x09\x0b-\x0c\x0e-\x7f]|(\r\n))*$", [{capture, none}]) of
+                match -> not has_lines_over_998(Body);
+                nomatch -> false
+            end
+    end.
+
+all_binaries_of(_Alphabet, 0) ->
+    [<<>>];
+all_binaries_of(Alphabet, Len) ->
+    [<<C, Rest/binary>> || C <- Alphabet, Rest <- all_binaries_of(Alphabet, Len - 1)].
+
+valid_7bit_differential_test_() ->
+    Alphabet = [0, 1, $a, $\t, $\r, $\n, 127, 128, 255],
+    [
+        {"every single byte", fun() ->
+            [?assertEqual({C, valid_7bit_re_reference(<<C>>)}, {C, valid_7bit(<<C>>)}) || C <- lists:seq(0, 255)]
+        end},
+        {"every pair of bytes", fun() ->
+            [
+                ?assertEqual({A, B, valid_7bit_re_reference(<<A, B>>)}, {A, B, valid_7bit(<<A, B>>)})
+             || A <- lists:seq(0, 255), B <- lists:seq(0, 255)
+            ]
+        end},
+        {timeout, 120,
+            {"every binary up to 5 bytes over a reduced alphabet", fun() ->
+                [
+                    ?assertEqual({Bin, valid_7bit_re_reference(Bin)}, {Bin, valid_7bit(Bin)})
+                 || Len <- lists:seq(0, 5), Bin <- all_binaries_of(Alphabet, Len)
+                ]
+            end}},
+        {timeout, 120,
+            {"random longer binaries", fun() ->
+                %% mostly valid bytes, so that both answers occur; fixed seed
+                Pool = [<<"\r\n">>, <<"\r\n">>, <<"\r\n">>, <<"a">>, <<"b">>, <<" ">>, <<"\t">>, <<1>>, <<127>>],
+                Odd = [<<"\r">>, <<"\n">>, <<0>>, <<128>>, <<255>>, <<"\n\r">>],
+                _ = rand:seed(exsss, {195, 7, 998}),
+                Pick = fun(L) -> lists:nth(rand:uniform(length(L)), L) end,
+                Gen = fun(OddOneIn) ->
+                    N = rand:uniform(300),
+                    iolist_to_binary([
+                        case rand:uniform(OddOneIn) of
+                            1 -> Pick(Odd);
+                            _ -> Pick(Pool)
+                        end
+                     || _ <- lists:seq(1, N)
+                    ])
+                end,
+                Results = [
+                    begin
+                        Bin = Gen(OddOneIn),
+                        Expected = valid_7bit_re_reference(Bin),
+                        ?assertEqual({Bin, Expected}, {Bin, valid_7bit(Bin)}),
+                        Expected
+                    end
+                 || OddOneIn <- [1000000, 1000000, 200, 50, 10], _ <- lists:seq(1, 1000)
+                ],
+                %% the generator must exercise both answers
+                ?assert(lists:member(true, Results)),
+                ?assert(lists:member(false, Results))
+            end}},
+        {"lines of 997, 998 and 999 bytes, with and without a trailing CRLF", fun() ->
+            [
+                begin
+                    Line = binary:copy(<<$a>>, Len),
+                    Bin = <<Prefix/binary, Line/binary, Suffix/binary>>,
+                    ?assertEqual({Len, Prefix, Suffix, valid_7bit_re_reference(Bin)}, {
+                        Len, Prefix, Suffix, valid_7bit(Bin)
+                    })
+                end
+             || Len <- [996, 997, 998, 999, 1000],
+                Prefix <- [<<>>, <<"short\r\n">>],
+                Suffix <- [<<>>, <<"\r\n">>, <<"\r\nshort">>, <<"\n">>, <<"\r">>]
+            ]
+        end}
+    ].
 
 encode_quoted_printable_test_() ->
     [
